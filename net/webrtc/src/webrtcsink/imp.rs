@@ -1003,7 +1003,6 @@ impl PayloadChainBuilder {
                     .build_encoder()
                     .expect("We should always have an encoder for negotiated codecs")?;
                 elements.push(encoder.clone());
-                elements.push(make_element("capsfilter", None)?);
 
                 Some(encoder)
             };

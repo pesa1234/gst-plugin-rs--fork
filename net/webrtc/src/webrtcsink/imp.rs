@@ -74,6 +74,7 @@ const DEFAULT_CONGESTION_CONTROL: WebRTCSinkCongestionControl =
 const DEFAULT_DO_FEC: bool = true;
 const DEFAULT_DO_RETRANSMISSION: bool = true;
 const DEFAULT_DO_CLOCK_SIGNALLING: bool = false;
+const DEFAULT_H264_DROP_PROFILE_LEVEL_ID: bool = false;
 const DEFAULT_ENABLE_DATA_CHANNEL_NAVIGATION: bool = false;
 const DEFAULT_ENABLE_CONTROL_DATA_CHANNEL: bool = false;
 const DEFAULT_ICE_TRANSPORT_POLICY: WebRTCICETransportPolicy = WebRTCICETransportPolicy::All;
@@ -115,6 +116,7 @@ struct Settings {
     do_fec: bool,
     do_retransmission: bool,
     do_clock_signalling: bool,
+    h264_drop_profile_level_id: bool,
     enable_data_channel_navigation: bool,
     enable_control_data_channel: bool,
     meta: Option<gst::Structure>,
@@ -556,6 +558,7 @@ impl Default for Settings {
             do_fec: DEFAULT_DO_FEC,
             do_retransmission: DEFAULT_DO_RETRANSMISSION,
             do_clock_signalling: DEFAULT_DO_CLOCK_SIGNALLING,
+            h264_drop_profile_level_id: DEFAULT_H264_DROP_PROFILE_LEVEL_ID,
             enable_data_channel_navigation: DEFAULT_ENABLE_DATA_CHANNEL_NAVIGATION,
             enable_control_data_channel: DEFAULT_ENABLE_CONTROL_DATA_CHANNEL,
             meta: None,
@@ -1487,8 +1490,26 @@ impl SessionInner {
             .property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
         transceiver.set_property("codec-preferences", None::<gst::Caps>);
 
-        let (enc_caps, pay_caps) =
+        let (mut enc_caps, mut pay_caps) =
             codec.webrtc_negotiated_caps(&caps, webrtc_pad.ssrc, &webrtc_pad.in_caps);
+
+        if element
+            .imp()
+            .settings
+            .lock()
+            .unwrap()
+            .h264_drop_profile_level_id
+            && codec.name.eq_ignore_ascii_case("H264")
+        {
+            if let Some(s) = enc_caps.make_mut().structure_mut(0) {
+                s.remove_fields(["profile", "level", "profile-level-id", "level-asymmetry-allowed"]);
+            }
+
+            if let Some(s) = pay_caps.make_mut().structure_mut(0) {
+                s.remove_fields(["profile", "level", "profile-level-id", "level-asymmetry-allowed"]);
+            }
+        }
+
         gst::info!(CAT, "Encoder filter caps: {:#?}", enc_caps);
         encoding_chain.enc_filter.set_property("caps", enc_caps);
         gst::info!(CAT, "Payloader filter caps: {:#?}", pay_caps);
@@ -4259,6 +4280,20 @@ impl BaseWebRTCSink {
         extension_configuration_type: ExtensionConfigurationType,
     ) -> Result<gst::Structure, Error> {
         let pipe = PipelineWrapper(gst::Pipeline::default());
+        let h264_drop_profile_level_id = self.settings.lock().unwrap().h264_drop_profile_level_id;
+        let effective_output_caps = if h264_drop_profile_level_id {
+            let mut caps = output_caps.clone();
+            if let Some(s) = caps.make_mut().structure_mut(0) {
+                let is_h264_rtp = s.has_name("application/x-rtp") && codec.name == "H264";
+                let is_h264_codec = s.has_name("video/x-h264");
+                if is_h264_rtp || is_h264_codec {
+                    s.remove_fields(["profile", "level", "profile-level-id", "level-asymmetry-allowed"]);
+                }
+            }
+            caps
+        } else {
+            output_caps.clone()
+        };
 
         let has_raw_input = has_raw_caps(&input_caps);
         let src = discovery_info.create_src();
@@ -4289,7 +4324,7 @@ impl BaseWebRTCSink {
         let payload_chain_builder = PayloadChainBuilder::new(
             &src.caps()
                 .expect("Caps should always be set when starting discovery"),
-            output_caps,
+            &effective_output_caps,
             &codec,
             self.obj().emit_by_name::<Option<gst::Element>>(
                 "request-encoded-filter",
@@ -4681,14 +4716,33 @@ impl BaseWebRTCSink {
         let caps_type = current.name();
         if caps_type.starts_with("video/") {
             if caps_type == "video/x-h264" {
-                if !self.check_h264_caps_compatibility(current, new) {
+                let drop_h264_profile_level_id = self
+                    .settings
+                    .lock()
+                    .unwrap()
+                    .h264_drop_profile_level_id;
+
+                if !drop_h264_profile_level_id && !self.check_h264_caps_compatibility(current, new)
+                {
                     return false;
                 }
 
                 const H264_ALLOWED_CHANGES: &[&str] = &["profile", "level"];
+                const H264_ALLOWED_CHANGES_DROPPED: &[&str] = &[
+                    "profile",
+                    "level",
+                    "profile-level-id",
+                    "level-asymmetry-allowed",
+                ];
 
-                current.remove_fields(H264_ALLOWED_CHANGES.iter().copied());
-                new.remove_fields(H264_ALLOWED_CHANGES.iter().copied());
+                let h264_allowed_changes = if drop_h264_profile_level_id {
+                    H264_ALLOWED_CHANGES_DROPPED
+                } else {
+                    H264_ALLOWED_CHANGES
+                };
+
+                current.remove_fields(h264_allowed_changes.iter().copied());
+                new.remove_fields(h264_allowed_changes.iter().copied());
             }
 
             const VIDEO_ALLOWED_CHANGES: &[&str] = &[
@@ -5070,6 +5124,12 @@ impl ObjectImpl for BaseWebRTCSink {
                     .default_value(DEFAULT_DO_CLOCK_SIGNALLING)
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecBoolean::builder("h264-drop-profile-level-id")
+                    .nick("Drop H264 profile-level-id")
+                    .blurb("Whether H264 profile-level-id and level-asymmetry-allowed should be removed from negotiated RTP caps")
+                    .default_value(DEFAULT_H264_DROP_PROFILE_LEVEL_ID)
+                    .mutable_ready()
+                    .build(),
                 /**
                  * GstBaseWebRTCSink:enable-data-channel-navigation:
                  *
@@ -5293,6 +5353,11 @@ impl ObjectImpl for BaseWebRTCSink {
                 let mut settings = self.settings.lock().unwrap();
                 settings.do_clock_signalling = value.get::<bool>().expect("type checked upstream");
             }
+            "h264-drop-profile-level-id" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.h264_drop_profile_level_id =
+                    value.get::<bool>().expect("type checked upstream");
+            }
             "enable-data-channel-navigation" => {
                 let mut settings = self.settings.lock().unwrap();
                 settings.enable_data_channel_navigation =
@@ -5430,6 +5495,10 @@ impl ObjectImpl for BaseWebRTCSink {
             "do-clock-signalling" => {
                 let settings = self.settings.lock().unwrap();
                 settings.do_clock_signalling.to_value()
+            }
+            "h264-drop-profile-level-id" => {
+                let settings = self.settings.lock().unwrap();
+                settings.h264_drop_profile_level_id.to_value()
             }
             "enable-data-channel-navigation" => {
                 let settings = self.settings.lock().unwrap();
